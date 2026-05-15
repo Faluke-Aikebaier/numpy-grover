@@ -18,9 +18,11 @@ The Grover / Durr-Hoyer algorithm searches a pre-evaluated cost array of N point
 On a real quantum computer, the oracle evaluates all N grid points **simultaneously** (quantum parallelism), making the total cost genuinely O(√N). On classical hardware we cannot do this — the grid must still be evaluated point by point at O(N) cost before the search begins. So the true picture is:
 
 ```
-Classical exhaustive:        O(N) evaluate  +  O(N) search   =  O(N)  total
-Grover (classical hardware): O(N) evaluate  +  O(√N) search  =  O(N)  total
-Grover (quantum computer):   O(1) evaluate  +  O(√N) search  =  O(√N) total
+Classical search (pre-evaluated array):  O(N)   search  →  O(N)
+Grover (pre-evaluated array):            O(√N)  search  →  O(√N)  ← genuine speedup
+Classical search (callable f):           O(N) evaluate + O(N) search  →  O(N)
+Grover (callable f, classical hardware): O(N) evaluate + O(√N) search →  O(N)
+Grover (callable f, quantum computer):   O(1) evaluate + O(√N) search →  O(√N)
 ```
 
 **What you actually get on classical hardware:**
