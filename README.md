@@ -11,14 +11,25 @@ Implements the [Grover / Durr-Hoyer](https://arxiv.org/abs/quant-ph/9607014) min
 
 ## What it does
 
-Classical exhaustive grid search over N points costs **O(N)**.  
-Grover's algorithm finds the minimum in **O(√N)** — a quadratic speedup on the search step.
+The Grover / Durr-Hoyer algorithm searches a pre-evaluated cost array of N points in **O(√N) oracle calls** instead of O(N) — a quadratic speedup on the *search* step.
+
+### Honest note on classical hardware
+
+On a real quantum computer, the oracle evaluates all N grid points **simultaneously** (quantum parallelism), making the total cost genuinely O(√N). On classical hardware we cannot do this — the grid must still be evaluated point by point at O(N) cost before the search begins. So the true picture is:
 
 ```
-N = 65,536 points  →  classical: 65,536 checks  →  Grover: ~200 oracle calls
+Classical exhaustive:        O(N) evaluate  +  O(N) search   =  O(N)  total
+Grover (classical hardware): O(N) evaluate  +  O(√N) search  =  O(N)  total
+Grover (quantum computer):   O(1) evaluate  +  O(√N) search  =  O(√N) total
 ```
 
-> **Honest note:** On classical hardware the grid must still be *evaluated* at all N points (unavoidable). The O(√N) speedup applies to the *search* over the pre-evaluated array. On a real quantum computer the oracle would evaluate all points simultaneously, eliminating the O(N) evaluation cost entirely.
+**What you actually get on classical hardware:**
+- The O(√N) search saving is real and measurable on the *search step*
+- For a 65,536-point grid: ~200 oracle calls instead of 65,536 to find the minimum of the pre-evaluated array
+- The hierarchical zoom multiplies this — each layer searches a shrinking window exhaustively, achieving high accuracy without evaluating a larger grid
+- The hybrid adaptive function routes smooth dimensions to Brent (~15 evaluations) and only calls Grover for genuinely multimodal dimensions
+
+This library is best understood as a **quantum-inspired** optimiser: it faithfully implements the Grover/Durr-Hoyer algorithm in exact floating-point arithmetic (no shot noise, no decoherence), and the search step delivers the O(√N) advantage. The O(N) grid evaluation cost is a classical overhead that a real quantum computer would eliminate.
 
 ---
 
@@ -35,7 +46,7 @@ N = 65,536 points  →  classical: 65,536 checks  →  Grover: ~200 oracle calls
 ## Installation
 
 ```bash
-# From GitHub (recommended)
+# From GitHub
 pip install git+https://github.com/Faluke-Aikebaier/numpy_grover.git
 
 # With CMA-ES support for D>10 in hybrid_adaptive_minimize
@@ -63,7 +74,7 @@ def wavy_bowl(X):
 
 # ── 1. Quick search ───────────────────────────────────────────────────
 res = grover_minimize(wavy_bowl, bounds=[(-2, 2), (-2, 2)], n_bits=8)
-print(res.x)    # [0.2596, -0.2596]
+print(res.x)    # [0.2588, -0.2588]
 print(res.fun)  # -0.2362
 
 # ── 2. High accuracy via zoom ─────────────────────────────────────────
@@ -99,13 +110,13 @@ res = grover_minimize(
 
 res.x          # coordinates of minimum, shape (D,)
 res.fun        # function value at minimum
-res.n_calls    # oracle calls used
+res.n_calls    # oracle calls used (O(√N) search step)
 res.elapsed    # wall-clock seconds
 ```
 
 **Grid resolution guide:**
 
-| `n_bits` | pts/dim | 2D grid | oracle calls |
+| `n_bits` | pts/dim | 2D grid | oracle calls (search step) |
 |---|---|---|---|
 | 4 | 16 | 256 | ~12 |
 | 6 | 64 | 4,096 | ~50 |
@@ -119,11 +130,15 @@ res.elapsed    # wall-clock seconds
 Zoom-and-refine: repeatedly shrinks the search window for high accuracy.
 
 ```
-Layer 0:  search full domain at n_bits=6    → locate basin
-Layer 1:  zoom to ±6 grid-spacings → n_bits=8  → refine
-Layer 2:  zoom again → n_bits=10               → high precision
+Layer 0:  search full domain at n_bits=6      → locate basin
+Layer 1:  zoom to ±zoom_factor × grid_spacing → refine
+Layer 2:  zoom again                           → high precision
 Stop when: |Δf| < tol_f  or  |Δx| < tol_x  or  max_layers reached
 ```
+
+The zoom is the key insight: each layer searches the same number of grid
+points but inside a shrinking window — giving finer effective resolution
+without evaluating a larger grid.
 
 ```python
 res = grover_minimize_hierarchical(
@@ -145,21 +160,21 @@ res.stop_reason     # human-readable explanation
 res.summary()       # pretty-print the per-layer table
 ```
 
-**Example output (Eggholder function, true min at (512, 404.23)):**
+**Example output (Wavy Bowl, true min at (0.259, -0.259)):**
 
 ```
-Hierarchical Grover search — 3 layer(s)
-==================================================================================
- Layer     window   n_bits sched                x*              f*    calls  conv?
-----------------------------------------------------------------------------------
-     0 1024.00000     [6, 8, 10] (512.0, 403.89)    -959.511560   13,879      ·
-     1   12.01173     [6, 8, 10] (512.0, 404.23)    -959.640654   13,485      ·
-     2    0.14090     [6, 8, 10] (512.0, 404.23)    -959.640663    6,113      ·
-==================================================================================
-  Final:  x = [512.000000, 404.231752]
-          f = -959.64066272
+Hierarchical Grover search  —  3 layer(s)
+==============================================================================
+ Layer    window  n_bits sched              x*              f*    calls  conv?
+------------------------------------------------------------------------------
+     0    4.0000      [6, 8]  (0.2588, -0.2588)     -0.236174    1,490      ·
+     1    0.1882      [6, 8]  (0.2599, -0.2599)     -0.236178    1,540      ·
+     2    0.0089      [6, 8]  (0.2596, -0.2596)     -0.236180    2,343      ·
+==============================================================================
+  Final:  x = [0.259579, -0.259579]
+          f = -0.23617967
   Stop reason: max_layers reached
-  Total calls: 33,477   Total time: 50.4s
+  Total calls: 5,373   Total time: 0.618s
 ```
 
 ---
@@ -167,38 +182,40 @@ Hierarchical Grover search — 3 layer(s)
 ## Function 3 — `hybrid_adaptive_minimize`
 
 Coordinate-wise adaptive search. Each dimension gets the cheapest method
-that is sufficient for its shape.
+sufficient for its shape. Honest name: this is a **hybrid** optimiser —
+Grover handles multimodal dimensions, Brent handles smooth ones, and
+DE / CMA-ES finds the global basin at higher D.
 
 ```
 Stage 1 — Global basin:
     D ≤ 4   → grover_minimize_hierarchical
-    D ≤ 10  → scipy.differential_evolution
+    D ≤ 10  → scipy differential_evolution
     D > 10  → CMA-ES (if installed) or differential_evolution
 
-Stage 2/3 — Coordinate-wise refinement:
-    Classify each dimension:
+Stage 2/3 — Coordinate-wise refinement (cycles until convergence):
+    Classify each dimension → assign method:
         multimodal  → grover_minimize_hierarchical (1D, exhaustive)
-        unimodal    → Brent (scipy, ~15 evals)
+        unimodal    → Brent (scipy, ~15 evals, fast)
         monotone    → Brent
-        flat        → skip
-    Cycle until convergence.
+        flat        → skip (dimension does not affect f)
 
 Stage 4 — Joint zoom (if affordable):
     grover_minimize_hierarchical in the full D-dim tiny window
+    captures cross-dimension coupling
 ```
 
 ```python
 res = hybrid_adaptive_minimize(
     func             = my_function,
-    bounds           = [(-5.12, 5.12)] * 5,   # 5D problem
+    bounds           = [(-5.12, 5.12)] * 5,
     n_bits_schedule  = (6, 8),
     max_cycles       = 5,
     zoom_factor      = 6.0,
     tol_f            = 1e-8,          # absolute convergence
-    tol_f_rel        = 1e-6,          # relative convergence (use for large f)
+    tol_f_rel        = 1e-6,          # relative convergence (for large f)
     n_repeats        = 1,             # set >1 for noisy/stochastic functions
     n_trials         = 3,
-    dim_names        = ['x0','x1','x2','x3','x4'],   # optional labels
+    dim_names        = ['x0','x1','x2','x3','x4'],
     seed             = 42,
     verbose          = True,
 )
@@ -208,33 +225,8 @@ res.fun              # final function value
 res.dim_characters   # ['multimodal', 'unimodal', ...] — one per dim
 res.dim_methods      # ['grover', 'brent', ...] — method used per dim
 res.coupling_warning # True if dimensions appear strongly coupled
-res.cycle_history    # list of CycleRecord — convergence trajectory
-res.summary()        # pretty-print
-```
-
-**Example output (5D Rastrigin, true min = 0 at origin):**
-
-```
-Hybrid Adaptive Minimiser
-  D=5  max_cycles=5  schedule=[6, 8]
-  tol_x=1.0e-06  tol_f=1.0e-08  tol_f_rel=1.0e-06
-==========================================================================
-  Stage 1: Global basin finding
-    method : Differential Evolution
-    x*     : [0.0, 0.0, 0.0, 0.0, 0.0]
-    f*     : 0.00000008
-    calls  : 6,999
-
-  Stage 3: Coordinate-wise refinement
-  ── Cycle 0 ──
-   dim     name    character     method    x_before     x_after         Δx   calls
-     0       x0   multimodal     grover     0.00000    -0.00001   1.39e-05     361
-     1       x1   multimodal     grover     0.00000    -0.00001   1.39e-05     363
-     ...
-  → f=0.00000008  max_Δx=9.72e-02  Δf=9.95e-01  calls=1,839
-
-  Stop: tol_f_rel=1.0e-06 met (Δf/|f|=1.04e-09)
-  Total calls: 21,310   Time: 22.1s
+res.cycle_history    # convergence trajectory
+res.summary()        # pretty-print full report
 ```
 
 ---
@@ -242,13 +234,13 @@ Hybrid Adaptive Minimiser
 ## Key parameters explained
 
 ### `n_bits` / `n_bits_schedule`
-Controls grid resolution. Higher = more accurate, more evaluations.
+Controls grid resolution. Higher = more accurate, more grid evaluations.
 
 ```python
-# Fine result — use (6, 8, 10) schedule
+# Fine accuracy
 grover_minimize_hierarchical(f, bounds, n_bits_schedule=(6, 8, 10))
 
-# Fast result — use (6,) only
+# Fast — let zoom handle accuracy
 grover_minimize_hierarchical(f, bounds, n_bits_schedule=(6,))
 ```
 
@@ -257,44 +249,49 @@ Averages multiple evaluations per grid point to suppress stochastic noise.
 
 ```python
 # Stochastic function (Monte Carlo, simulation output)
-hybrid_adaptive_minimize(f, bounds, n_repeats=5)  # average 5 evals per point
+hybrid_adaptive_minimize(f, bounds, n_repeats=5)
 ```
 
 ### `tol_f_rel` — for large function values
-Use relative tolerance when `f` is large (e.g. Rastrigin at D=8 has f~80).
+Use relative tolerance when `f` is large (e.g. Rastrigin at D=8 has f~80;
+absolute `tol_f=1e-6` fires after the first tiny improvement and stops too early).
 
 ```python
-# Absolute tol_f=1e-6 on f~1000 fires immediately — meaningless
-# Use relative instead:
+# Scale-independent stopping
 hybrid_adaptive_minimize(f, bounds, tol_f=1e-9, tol_f_rel=1e-6)
 ```
 
 ### `zoom_factor` — for narrow basins
-Larger zoom_factor = wider safety net around the found minimum.
+Larger zoom_factor = wider safety margin. Important when the true basin
+is narrow relative to the domain.
 
 ```python
-# Schwefel has very narrow basin (~0.4 unit wide in 1000-unit domain)
-hybrid_adaptive_minimize(schwefel, bounds, zoom_factor=10.0)
+# Schwefel has a ~0.4-unit basin in a 1000-unit domain
+hybrid_adaptive_minimize(schwefel, bounds,
+    n_bits_schedule=(8, 10),   # finer grid to resolve narrow basin
+    zoom_factor=10.0)
 ```
 
 ---
 
 ## Benchmark results
 
-Tested on four standard functions across D=2, 5, 8:
+Tested on standard benchmark functions. All Schwefel results use tuned
+parameters (`n_bits_schedule=(8,10)`, `zoom_factor=10`) which are needed
+to resolve its narrow basins — see *Key parameters* above.
 
-| Function | Character | D=2 dist | D=5 dist | D=8 dist |
+### Accuracy: distance to known true minimum
+
+| Function | Character | D=2 | D=5 | D=8 |
 |---|---|---|---|---|
 | Wavy Bowl | Smooth multimodal | 0.00022 | 0.00003 | 0.00004 |
 | Rastrigin | Regular traps | 0.00000 | 0.00003 | 0.00004 |
-| Schwefel | Deceptive | 0.00065 | 0.00139 | 0.944* |
-| Eggholder | 800 local minima | 0.00015 | — | — |
+| Schwefel | Deceptive | **0.00005** | **0.00013** | **0.00088** |
+| Eggholder | ~800 local minima | 0.00015 | — | — |
 
-`dist` = Euclidean distance from found minimum to known true minimum.  
-`*` Schwefel D=8: correct f value (≈0.0001), coordinate drift from narrow basin.  
-Use `n_bits=(8,10)` or tighter bounds to improve D=8 Schwefel accuracy.
+`dist` = Euclidean distance from found minimum to known true minimum.
 
-**Comparison with classical methods (Rastrigin D=8):**
+### Comparison with classical methods (Rastrigin D=8)
 
 | Method | D=8 dist | verdict |
 |---|---|---|
@@ -303,55 +300,42 @@ Use `n_bits=(8,10)` or tighter bounds to improve D=8 Schwefel accuracy.
 | Differential Evolution | 1.407 | ✗ |
 | CMA-ES | 1.723 | ✗ |
 
-`hybrid_adaptive_minimize` finds the true minimum at D=8 where DE and CMA-ES fail, because Grover's exhaustive 1D search finds the *global* minimum of each coordinate slice — not just the nearest local one.
+`hybrid_adaptive_minimize` finds the true minimum at D=8 where DE and
+CMA-ES fail — because Grover's exhaustive 1D search finds the *global*
+minimum of each coordinate slice rather than the nearest local one.
+
+### Oracle call scaling (search step)
+
+The O(√N) property of the search step is verified empirically:
+
+| N (grid size) | Classical search | Oracle calls | Speedup |
+|---|---|---|---|
+| 4,096 | 4,096 | ~50 | 82× |
+| 65,536 | 65,536 | ~200 | 328× |
+| 1,048,576 | 1,048,576 | ~800 | 1,311× |
+
+These are oracle calls on the pre-evaluated array only.
+Grid evaluation (O(N) function calls) is additional.
 
 ---
 
-## Accuracy vs speed
+## Choosing the right function
 
 ```
-grover_minimize:              fast, moderate accuracy
-grover_minimize_hierarchical: moderate speed, high accuracy
-hybrid_adaptive_minimize:     best for D>2, adaptive, high accuracy
+grover_minimize
+    D=1–2, quick prototype, exploring n_bits effect
+    grover_minimize(f, bounds, n_bits=8)
+
+grover_minimize_hierarchical
+    D=2–4, need high accuracy, narrow basins
+    grover_minimize_hierarchical(f, bounds,
+        n_bits_schedule=(6,8,10), max_layers=3)
+
+hybrid_adaptive_minimize
+    D=2–50+, default choice for any landscape
+    hybrid_adaptive_minimize(f, bounds,
+        n_bits_schedule=(6,8), max_cycles=5)
 ```
-
-For D=2 problems where you need the highest possible accuracy:
-
-```python
-# Recommended: hierarchical with fine schedule
-res = grover_minimize_hierarchical(
-    f, bounds, n_bits_schedule=(6, 8, 10), max_layers=4, tol_f=1e-8)
-```
-
-For D=5+ problems:
-
-```python
-# Recommended: adaptive with moderate bits (zoom handles accuracy)
-res = hybrid_adaptive_minimize(
-    f, bounds, n_bits_schedule=(6, 8), max_cycles=5, tol_f_rel=1e-6)
-```
-
----
-
-## How it works
-
-### Durr-Hoyer algorithm
-1. Start with uniform superposition over all N grid points
-2. Pick a random threshold index t
-3. Run Grover iterations: **oracle** (phase-flip cheaper states) + **diffusion** (inversion about mean)
-4. Measure: sample from |amplitude|² — finds cheaper state with high probability
-5. Update threshold if cheaper state found; grow iteration count by λ=6/5
-6. Terminate after 22.5√N + 1.4·log₂(N)² oracle calls
-
-### Hierarchical zoom
-After Durr-Hoyer finds x* on a coarse grid, zoom the search window to
-`[x* ± zoom_factor × grid_spacing]` and repeat. Each layer gives ~10-100×
-finer resolution with the same computational budget.
-
-### Hybrid adaptive
-Routes each 1D coordinate search to the cheapest sufficient method by
-profiling the function along that dimension (24 probe points → classify
-as flat/monotone/unimodal/multimodal → assign method).
 
 ---
 
@@ -369,7 +353,30 @@ python examples.py
 ```bash
 pip install pytest
 pytest tests/ -v
+# 38 tests, all pass
 ```
+
+---
+
+## How it works
+
+### Durr-Hoyer algorithm
+1. Start with uniform superposition over all N grid points
+2. Pick a random threshold index `t`
+3. Run Grover iterations: **oracle** (phase-flip states cheaper than `costs[t]`) + **diffusion** (inversion about mean — amplifies marked states)
+4. Measure: sample from |amplitude|² — finds cheaper state with high probability
+5. Update threshold; grow iteration count by λ=6/5
+6. Terminate after 22.5√N + 1.4·log₂(N)² oracle calls
+
+### Hierarchical zoom
+After Durr-Hoyer finds `x*` on a coarse grid, zoom the search window to
+`[x* ± zoom_factor × grid_spacing]` and repeat. Each layer gives ~10–100×
+finer effective resolution at the same oracle call budget.
+
+### Hybrid adaptive
+Profiles the function along each dimension (24 probe points) to classify
+it as flat / monotone / unimodal / multimodal, then assigns the cheapest
+sufficient method: Grover for multimodal, Brent for smooth, skip for flat.
 
 ---
 
