@@ -1,0 +1,46 @@
+[build-system]
+requires      = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "numpy_grover"
+version     = "0.1.0"
+description = "Quantum-inspired global optimisation using the Grover / Durr-Hoyer algorithm"
+readme      = "README.md"
+license     = { file = "LICENSE" }
+authors     = [{ name = "Faluke Aikebaier" }]
+keywords    = [
+    "optimisation", "optimization", "grover", "quantum-inspired",
+    "global minimisation", "minimization", "durr-hoyer",
+    "multimodal", "black-box", "numpy",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+requires-python = ">=3.9"
+dependencies    = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+cmaes = ["cma>=3.3"]          # enables CMA-ES in hybrid_adaptive_minimize (D>10)
+full  = ["cma>=3.3", "matplotlib>=3.6"]
+
+[project.urls]
+Homepage    = "https://github.com/Faluke-Aikebaier/numpy_grover"
+Repository  = "https://github.com/Faluke-Aikebaier/numpy_grover"
+Issues      = "https://github.com/Faluke-Aikebaier/numpy_grover/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["numpy_grover*"]
