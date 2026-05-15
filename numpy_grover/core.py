@@ -865,6 +865,7 @@ class AdaptiveGroverResult:
     converged      : bool
     stop_reason    : str
     coupling_warning: bool = False   # True if strong coupling detected
+    dim_n_bits     : list  = None    # n_bits used per dim (adaptive_n_bits mode)
 
     def __repr__(self) -> str:
         coords = ", ".join(f"{v:.6g}" for v in self.x)
@@ -988,6 +989,9 @@ def hybrid_adaptive_minimize(
     max_joint_grid     : int   = 4_000_000,
     n_trials           : int   = 3,
     n_repeats          : int   = 1,
+    adaptive_n_bits    : bool  = False,
+    min_bits           : int   = 4,
+    max_bits           : int   = 14,
     seed               : Optional[int] = 42,
     dim_names          : Optional[list] = None,
     vectorized         : bool  = True,
@@ -1034,9 +1038,15 @@ def hybrid_adaptive_minimize(
     n_trials        : Durr-Hoyer trials per Grover call
     n_repeats       : evaluations averaged per grid point (noise reduction).
                       n_repeats=1 (default) — no averaging, deterministic.
-                      n_repeats>1 — average n_repeats evaluations per point,
-                      reducing stochastic noise at cost of n_repeats× more
-                      function calls.
+                      n_repeats>1 — average n_repeats evaluations per point.
+    adaptive_n_bits : if True, estimate the required n_bits per dimension
+                      from the local curvature (basin width) at the current
+                      best point.  Narrow basins (Schwefel) get high n_bits
+                      automatically; wide basins (Rastrigin) get low n_bits.
+                      Overrides n_bits_schedule for multimodal dimensions.
+                      Default False — use n_bits_schedule uniformly.
+    min_bits        : minimum n_bits when adaptive_n_bits=True (default 4)
+    max_bits        : maximum n_bits when adaptive_n_bits=True (default 14)
     seed            : master random seed
     dim_names       : optional list of D strings for verbose output
     vectorized      : True if func accepts (N, D) array input
@@ -1047,6 +1057,7 @@ def hybrid_adaptive_minimize(
     AdaptiveGroverResult
         .x, .fun, .n_calls, .n_cycles, .elapsed
         .dim_characters, .dim_methods   — per-dimension classification
+        .dim_n_bits                     — n_bits used per dim (adaptive mode)
         .cycle_history                  — convergence trajectory
         .coupling_warning               — True if strong coupling detected
         .stop_reason                    — why search stopped
@@ -1108,7 +1119,52 @@ def hybrid_adaptive_minimize(
         print(f"  tol_x={tol_x:.1e}  tol_f={tol_f:.1e}  tol_f_rel={tol_f_rel:.1e}")
         if n_repeats > 1:
             print(f"  n_repeats={n_repeats}  (noise averaging active)")
+        if adaptive_n_bits:
+            print(f"  adaptive_n_bits=True  min={min_bits}  max={max_bits}")
         print(SEP)
+
+    # ── Adaptive n_bits estimator ─────────────────────────────────────────
+    def estimate_n_bits_for_dim(x_cur, d):
+        """
+        Estimate required n_bits for dimension d by probing local curvature.
+
+        Uses a finite-difference second derivative to estimate the basin
+        width at the current best point, then computes the n_bits needed
+        so that at least 4 grid points fall inside the basin.
+
+        Returns an integer n_bits clipped to [min_bits, max_bits].
+        """
+        lo, hi = orig_bounds[d]
+        domain_width = hi - lo
+        # Step size: 1% of domain, but at least 1e-4
+        h = max(domain_width * 0.01, 1e-4)
+
+        x_c = x_cur.copy()
+        x_p = x_cur.copy(); x_p[d] = np.clip(x_cur[d] + h, lo, hi)
+        x_m = x_cur.copy(); x_m[d] = np.clip(x_cur[d] - h, lo, hi)
+
+        fc = float(func(x_c.reshape(1,-1))[0])
+        fp = float(func(x_p.reshape(1,-1))[0])
+        fm = float(func(x_m.reshape(1,-1))[0])
+
+        f_pp = (fp - 2*fc + fm) / h**2   # second derivative estimate
+
+        if abs(f_pp) < 1e-12:
+            # Flat curvature — use default
+            return n_bits_schedule[-1]
+
+        # Basin width: distance from minimum where f rises by tol_f
+        # f ≈ fc + 0.5·f''·(x-x*)²  →  basin_width = 2√(2·tol_f/|f''|)
+        basin_width = 2.0 * np.sqrt(2.0 * max(abs(tol_f), 1e-8) / abs(f_pp))
+        basin_width = min(basin_width, domain_width)   # can't exceed domain
+
+        # Need at least 4 grid points inside the basin
+        required_spacing = basin_width / 4.0
+        if required_spacing <= 0:
+            return max_bits
+
+        nb = int(np.ceil(np.log2(domain_width / required_spacing)))
+        return int(np.clip(nb, min_bits, max_bits))
 
     # ══════════════════════════════════════════════════════════════════════
     # STAGE 1 — Global basin finding
@@ -1121,19 +1177,32 @@ def hybrid_adaptive_minimize(
     stage1_fun    = np.inf
 
     if D <= 4:
-        stage1_method = "Grover hierarchical"
-        r = grover_minimize_hierarchical(
-            func, bounds,
-            n_bits_schedule=n_bits_schedule,
-            max_layers=3, zoom_factor=zoom_factor,
-            tol_f=tol_f, tol_x=tol_x,
-            n_trials=n_trials, seed=next_seed(),
-            vectorized=vectorized, verbose=False,
-            n_repeats=n_repeats,
-        )
-        stage1_x   = r.x.copy()
-        stage1_fun = r.fun
-        total_calls[0] += r.n_calls
+        # Coordinate-wise 1D Grover: much cheaper than full D-dim grid.
+        # Cost: D × 2^n_bits  vs  (2^n_bits)^D
+        # e.g. D=3, n_bits=6: 192 vs 262,144 grid evaluations
+        stage1_method = "Grover coord-wise 1D"
+        # Start from centre of each dimension
+        x_init = np.array([0.5*(lo+hi) for lo,hi in bounds])
+        stage1_calls_tmp = 0
+
+        for d in range(D):
+            lo, hi  = bounds[d]
+            f1d_vec = make_slice_vec(x_init, d)
+            _r1d    = grover_minimize_hierarchical(
+                f1d_vec, bounds=[(lo, hi)],
+                n_bits_schedule=n_bits_schedule,
+                max_layers=2, zoom_factor=zoom_factor,
+                tol_f=tol_f*10, tol_x=tol_x*10,
+                n_trials=n_trials, seed=next_seed(),
+                vectorized=True, verbose=False,
+                n_repeats=n_repeats,
+            )
+            x_init[d]       = float(np.clip(_r1d.x[0], lo, hi))
+            stage1_calls_tmp += _r1d.n_calls
+
+        stage1_x   = x_init.copy()
+        stage1_fun = float(func(stage1_x.reshape(1,-1))[0])
+        total_calls[0] += stage1_calls_tmp
 
     elif D <= 10:
         stage1_method = "Differential Evolution"
@@ -1187,6 +1256,7 @@ def hybrid_adaptive_minimize(
     cycle_history  = []
     dim_characters = ["unclassified"] * D
     dim_methods    = ["unclassified"] * D
+    dim_n_bits_rec = [None] * D          # recorded adaptive n_bits per dim
     converged      = False
     stop_reason    = "max_cycles reached"
 
@@ -1236,11 +1306,21 @@ def hybrid_adaptive_minimize(
 
             else:
                 # multimodal → Grover 1D hierarchical
-                method  = "grover"
+                method = "grover"
+
+                # Adaptive n_bits: estimate required resolution from curvature
+                if adaptive_n_bits:
+                    nb_for_dim = estimate_n_bits_for_dim(x_current, d)
+                    sched_for_dim = (max(min_bits, nb_for_dim - 2), nb_for_dim)
+                    if verbose:
+                        print(f"    [adaptive n_bits={nb_for_dim} for dim {d}]")
+                else:
+                    sched_for_dim = n_bits_schedule
+
                 _r      = grover_minimize_hierarchical(
                     make_slice_vec(x_current, d),
                     bounds=[(lo, hi)],
-                    n_bits_schedule=n_bits_schedule,
+                    n_bits_schedule=sched_for_dim,
                     max_layers=3, zoom_factor=zoom_factor,
                     tol_f=tol_f, tol_x=max(tol_x*(hi-lo), 1e-12),
                     n_trials=n_trials, seed=next_seed(),
@@ -1254,6 +1334,10 @@ def hybrid_adaptive_minimize(
             x_current[d]   = x_d_after
             if f_after < best_f:
                 best_f = f_after
+
+            # Record adaptive n_bits used
+            if adaptive_n_bits and char == "multimodal":
+                dim_n_bits_rec[d] = estimate_n_bits_for_dim(x_current, d)
 
             delta_x     = abs(x_d_after - x_d_before)
             cycle_calls += d_calls
@@ -1395,6 +1479,7 @@ def hybrid_adaptive_minimize(
         joint_zoom_done=joint_zoom_done,
         converged=converged, stop_reason=stop_reason,
         coupling_warning=coupling_warning,
+        dim_n_bits=dim_n_bits_rec,
     )
 
 
@@ -1435,6 +1520,275 @@ BENCHMARK_FUNCTIONS = {
     "rosenbrock": (_rosenbrock, [(-2.0,  2.0), (-1.0, 3.0)]),
     "himmelblau": (_himmelblau, [(-5.0,  5.0), (-5.0, 5.0)]),
 }
+
+
+# ---------------------------------------------------------------------------
+# Benchmark suite — all five canonical test functions with metadata
+# ---------------------------------------------------------------------------
+
+def _wavy_bowl(X: np.ndarray) -> np.ndarray:
+    """f(x,y) = x²+y² + 0.4·sin(5x)·sin(5y).  True min ≈ -0.2362."""
+    x, y = X[:, 0], X[:, 1]
+    return x**2 + y**2 + 0.4 * np.sin(5.0*x) * np.sin(5.0*y)
+
+def _schwefel(X: np.ndarray) -> np.ndarray:
+    """Deceptive.  True min ≈ 0 at (420.969,…)."""
+    D = X.shape[1]
+    return 418.9829 * D - np.sum(X * np.sin(np.sqrt(np.abs(X))), axis=1)
+
+def _eggholder(X: np.ndarray) -> np.ndarray:
+    """~800 local minima; global min at corner (512, 404.23)."""
+    x, y = X[:, 0], X[:, 1]
+    return (-(y + 47) * np.sin(np.sqrt(np.abs(x/2 + (y + 47))))
+            - x * np.sin(np.sqrt(np.abs(x - (y + 47)))))
+
+def _styblinski_tang(X: np.ndarray) -> np.ndarray:
+    """Near-symmetric double wells.  True min = -78.332 at (-2.904,…)."""
+    return 0.5 * np.sum(X**4 - 16*X**2 + 5*X, axis=1)
+
+
+class BenchmarkSuite:
+    """
+    Collection of canonical test functions for benchmarking minimisers.
+
+    Each function is registered with:
+      - vectorised callable  f(X), X shape (N, D) → (N,)
+      - default bounds       list of (lo, hi) per dimension
+      - known true minimum   x* and f*
+      - difficulty tag
+
+    Usage
+    -----
+    >>> suite = BenchmarkSuite()
+    >>> suite.names
+    ['wavy_bowl', 'rastrigin', 'schwefel', 'eggholder', 'styblinski_tang']
+
+    >>> entry = suite['wavy_bowl']
+    >>> entry.func(X)           # evaluate on grid
+    >>> entry.bounds            # [(-2,2), (-2,2)]
+    >>> entry.true_x            # np.array([0.25942, -0.25942])
+    >>> entry.true_f            # -0.236179
+    >>> entry.difficulty        # 'moderate'
+
+    >>> result = suite.run(
+    ...     'wavy_bowl',
+    ...     minimizer = hybrid_adaptive_minimize,
+    ...     n_bits_schedule = (6, 8),
+    ...     max_cycles = 3,
+    ...     seed = 42,
+    ... )
+    >>> result.dist    # distance to true minimum
+    >>> result.fun     # found function value
+    >>> result.elapsed # wall-clock seconds
+
+    >>> all_results = suite.run_all(
+    ...     hybrid_adaptive_minimize,
+    ...     n_bits_schedule=(6,8), max_cycles=3, seed=42,
+    ... )
+    """
+
+    # ── Inner containers ──────────────────────────────────────────────────
+
+    @dataclass
+    class Entry:
+        """Metadata for one benchmark function."""
+        name       : str
+        func       : object          # callable (N,D)->(N,)
+        bounds     : list            # [(lo,hi),...]  D=2 defaults
+        true_x     : np.ndarray      # known global minimum coordinates
+        true_f     : float           # known global minimum value
+        difficulty : str             # 'easy' | 'moderate' | 'hard' | 'deceptive'
+        description: str
+
+    @dataclass
+    class RunResult:
+        """Result of one minimiser run on one function."""
+        func_name : str
+        x         : np.ndarray
+        fun       : float
+        dist      : float            # distance to true minimum
+        n_calls   : int
+        elapsed   : float
+        raw       : object           # original result object
+
+    # ── Constructor ───────────────────────────────────────────────────────
+
+    def __init__(self):
+        self._entries = {}
+
+        # Wavy Bowl — brute-force reference minimum on fine grid
+        _g   = np.linspace(-2, 2, 2000)
+        _XX, _YY = np.meshgrid(_g, _g)
+        _XY  = np.stack([_XX.ravel(), _YY.ravel()], axis=1)
+        _Z   = _wavy_bowl(_XY)
+        _bi  = int(np.argmin(_Z))
+        _wb_x = _XY[_bi]
+        _wb_f = float(_Z[_bi])
+
+        self._register(self.Entry(
+            name        = 'wavy_bowl',
+            func        = _wavy_bowl,
+            bounds      = [(-2.0, 2.0), (-2.0, 2.0)],
+            true_x      = _wb_x,
+            true_f      = _wb_f,
+            difficulty  = 'moderate',
+            description = ('f(x,y) = x²+y² + 0.4·sin(5x)·sin(5y). '
+                           'Quadratic bowl with sinusoidal ripples. '
+                           '~25 local minima. Global min shifted from origin by ripples.'),
+        ))
+
+        self._register(self.Entry(
+            name        = 'rastrigin',
+            func        = _rastrigin,
+            bounds      = [(-5.12, 5.12), (-5.12, 5.12)],
+            true_x      = np.array([0.0, 0.0]),
+            true_f      = 0.0,
+            difficulty  = 'hard',
+            description = ('f(x) = 10D + Σ[xᵢ²-10cos(2πxᵢ)]. '
+                           'Highly multimodal with regular trap structure. '
+                           '~(10/π)^D local minima. Global min = 0 at origin.'),
+        ))
+
+        self._register(self.Entry(
+            name        = 'schwefel',
+            func        = _schwefel,
+            bounds      = [(-500.0, 500.0), (-500.0, 500.0)],
+            true_x      = np.array([420.9687, 420.9687]),
+            true_f      = float(_schwefel(np.array([[420.9687, 420.9687]]))[0]),
+            difficulty  = 'deceptive',
+            description = ('f(x) = 418.9829D - Σ xᵢsin(√|xᵢ|). '
+                           'Classically deceptive: second-best basin is far '
+                           'from the global minimum. Basin width ~0.4 units '
+                           'in 1000-unit domain.'),
+        ))
+
+        self._register(self.Entry(
+            name        = 'eggholder',
+            func        = _eggholder,
+            bounds      = [(-512.0, 512.0), (-512.0, 512.0)],
+            true_x      = np.array([512.0, 404.2319]),
+            true_f      = float(_eggholder(np.array([[512.0, 404.2319]]))[0]),
+            difficulty  = 'hard',
+            description = ('~800 local minima on [-512,512]². '
+                           'Global minimum at domain corner (512, 404.23). '
+                           'Impossible for local/gradient methods.'),
+        ))
+
+        self._register(self.Entry(
+            name        = 'styblinski_tang',
+            func        = _styblinski_tang,
+            bounds      = [(-5.0, 5.0), (-5.0, 5.0)],
+            true_x      = np.array([-2.903534, -2.903534]),
+            true_f      = float(_styblinski_tang(
+                              np.array([[-2.903534, -2.903534]]))[0]),
+            difficulty  = 'moderate',
+            description = ('f(x) = 0.5Σ[xᵢ⁴-16xᵢ²+5xᵢ]. '
+                           'Near-symmetric double wells per axis. '
+                           'Small tilt term breaks symmetry. '
+                           'True min = -78.332 at (-2.904,-2.904).'),
+        ))
+
+    def _register(self, entry: 'BenchmarkSuite.Entry'):
+        self._entries[entry.name] = entry
+
+    # ── Public interface ──────────────────────────────────────────────────
+
+    @property
+    def names(self) -> list:
+        """List of all registered function names."""
+        return list(self._entries.keys())
+
+    def __getitem__(self, name: str) -> 'BenchmarkSuite.Entry':
+        if name not in self._entries:
+            raise KeyError(f"Unknown function '{name}'. "
+                           f"Available: {self.names}")
+        return self._entries[name]
+
+    def __repr__(self) -> str:
+        lines = ["BenchmarkSuite:"]
+        for e in self._entries.values():
+            lines.append(f"  {e.name:<20} [{e.difficulty}]  "
+                         f"true_f={e.true_f:.4f}")
+        return "\n".join(lines)
+
+    def run(
+        self,
+        func_name : str,
+        minimizer : Callable,
+        bounds    : Optional[list] = None,
+        **kwargs,
+    ) -> 'BenchmarkSuite.RunResult':
+        """
+        Run one minimiser on one benchmark function.
+
+        Parameters
+        ----------
+        func_name : registered function name (e.g. 'wavy_bowl')
+        minimizer : any of grover_minimize, grover_minimize_hierarchical,
+                    hybrid_adaptive_minimize, or any callable with the same
+                    interface: minimizer(func, bounds, **kwargs)
+        bounds    : override default bounds (optional)
+        **kwargs  : passed through to minimizer
+
+        Returns
+        -------
+        BenchmarkSuite.RunResult
+        """
+        entry  = self[func_name]
+        bnd    = bounds if bounds is not None else entry.bounds
+        t0     = time.perf_counter()
+        result = minimizer(entry.func, bnd, **kwargs)
+        el     = time.perf_counter() - t0
+
+        # Extract x and fun from result (handles all three result types)
+        if hasattr(result, 'x'):
+            x   = np.asarray(result.x)
+            fun = float(result.fun)
+            nc  = getattr(result, 'n_calls', 0)
+        else:
+            # tuple (idx, n_calls) from grover_min_2d
+            x   = np.array([float(result[0])])
+            fun = float(entry.func(x.reshape(1,-1))[0])
+            nc  = int(result[1])
+
+        dist = float(np.linalg.norm(x - entry.true_x))
+
+        return self.RunResult(
+            func_name = func_name,
+            x         = x,
+            fun       = fun,
+            dist      = dist,
+            n_calls   = nc,
+            elapsed   = el,
+            raw       = result,
+        )
+
+    def run_all(
+        self,
+        minimizer : Callable,
+        verbose   : bool = True,
+        **kwargs,
+    ) -> dict:
+        """
+        Run one minimiser on all benchmark functions.
+
+        Returns dict mapping func_name → RunResult.
+        """
+        results = {}
+        if verbose:
+            print(f"Running {minimizer.__name__} on all benchmark functions")
+            print(f"{'Function':<22} {'dist':>10} {'f':>12} "
+                  f"{'calls':>8} {'time':>8}")
+            print("-" * 64)
+
+        for name in self.names:
+            r = self.run(name, minimizer, **kwargs)
+            results[name] = r
+            if verbose:
+                v = 'OK' if r.dist < 0.01 else ('~' if r.dist < 1.0 else 'FAIL')
+                print(f"  {name:<20} {r.dist:>10.5f} {r.fun:>12.6f} "
+                      f"{r.n_calls:>8,} {r.elapsed:>7.2f}s  {v}")
+        return results
 
 
 # ---------------------------------------------------------------------------

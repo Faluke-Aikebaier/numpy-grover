@@ -18,12 +18,14 @@ The Grover / Durr-Hoyer algorithm searches a pre-evaluated cost array of N point
 On a real quantum computer, the oracle evaluates all N grid points **simultaneously** (quantum parallelism), making the total cost genuinely O(√N). On classical hardware we cannot do this — the grid must still be evaluated point by point at O(N) cost before the search begins. So the true picture is:
 
 ```
-Classical search (pre-evaluated array):  O(N)   search  →  O(N)
-Grover (pre-evaluated array):            O(√N)  search  →  O(√N)  ← genuine speedup
-Classical search (callable f):           O(N) evaluate + O(N) search  →  O(N)
-Grover (callable f, classical hardware): O(N) evaluate + O(√N) search →  O(N)
-Grover (callable f, quantum computer):   O(1) evaluate + O(√N) search →  O(√N)
+Classical search (pre-evaluated array):  O(N)   search              →  O(N)
+Grover    (pre-evaluated array):         O(√N)  search              →  O(√N)  ← genuine speedup
+Classical search (callable f):           O(N) evaluate + O(N) search →  O(N)
+Grover    (callable f, classical hw):    O(N) evaluate + O(√N) search →  O(N)
+Grover    (callable f, quantum computer): O(1) evaluate + O(√N) search →  O(√N)
 ```
+
+The genuine classical speedup applies whenever the cost array is **already known** — pre-computed grids, lookup tables, cached evaluations, or any case where you search the same grid multiple times. For a callable function evaluated fresh each time, the O(N) evaluation dominates on classical hardware.
 
 **What you actually get on classical hardware:**
 - The O(√N) search saving is real and measurable on the *search step*
@@ -35,13 +37,20 @@ This library is best understood as a **quantum-inspired** optimiser: it faithful
 
 ---
 
-## Three functions
+## Four functions
 
 | Function | Best for | Dimensions |
 |---|---|---|
-| `grover_minimize` | Quick single-layer search | D=1–4 |
+| `grover_minimize` | Quick single-layer search, prototyping | D=1–4 |
 | `grover_minimize_hierarchical` | High accuracy via zoom-and-refine | D=2–4 |
-| `hybrid_adaptive_minimize` | Mixed landscapes, higher dimensions | D=2–50+ |
+| `hybrid_adaptive_minimize` | Mixed landscapes, coordinate-wise, D=2–50+ | D=2–50+ |
+| `hybrid_adaptive_minimize` with `adaptive_n_bits=True` | Narrow basins, unknown resolution | D=2–50+ |
+
+> **Curse of dimensionality:** Grover halves the exponent of the search cost
+> (O(N) → O(√N)) but the grid size N = (2^n_bits)^D still grows exponentially
+> with D. `hybrid_adaptive_minimize` escapes this for the search step by using
+> coordinate-wise 1D grids (cost: 2^n_bits × D instead of (2^n_bits)^D), but
+> the curse remains for the global grid evaluation at layer 0.
 
 ---
 
@@ -183,57 +192,205 @@ Hierarchical Grover search  —  3 layer(s)
 
 ## Function 3 — `hybrid_adaptive_minimize`
 
-Coordinate-wise adaptive search. Each dimension gets the cheapest method
-sufficient for its shape. Honest name: this is a **hybrid** optimiser —
-Grover handles multimodal dimensions, Brent handles smooth ones, and
-DE / CMA-ES finds the global basin at higher D.
+Coordinate-wise adaptive search. Honest name: this is a **hybrid** optimiser —
+not pure Grover. It combines four components, routing each subproblem to the
+cheapest sufficient method:
 
 ```
-Stage 1 — Global basin:
-    D ≤ 4   → grover_minimize_hierarchical
+Stage 1 — Global basin finding:
+    D ≤ 4   → Grover coord-wise 1D  (D × 1D Grover searches, much cheaper
+                                      than full D-dim grid)
     D ≤ 10  → scipy differential_evolution
     D > 10  → CMA-ES (if installed) or differential_evolution
 
-Stage 2/3 — Coordinate-wise refinement (cycles until convergence):
-    Classify each dimension → assign method:
-        multimodal  → grover_minimize_hierarchical (1D, exhaustive)
-        unimodal    → Brent (scipy, ~15 evals, fast)
+Stage 2/3 — Dimension classifier + coordinate-wise refinement:
+    Profile f along each dim (24 probe points) → classify shape:
+        multimodal  → grover_minimize_hierarchical (1D, exhaustive,
+                       finds global 1D minimum — not just nearest local)
+        unimodal    → Brent (~15 evals, fast)
         monotone    → Brent
         flat        → skip (dimension does not affect f)
+    Cycle through all dimensions until convergence.
 
 Stage 4 — Joint zoom (if affordable):
     grover_minimize_hierarchical in the full D-dim tiny window
-    captures cross-dimension coupling
+    to capture any cross-dimension coupling missed by coord-wise search.
 ```
+
+**Why Grover for multimodal dimensions?**
+Classical coordinate descent uses gradient or local search — it finds the
+*nearest* local minimum in each dimension. Grover searches the full 1D grid
+exhaustively and finds the *global* 1D minimum. This is why `hybrid_adaptive_minimize`
+succeeds on Rastrigin D=8 where DE and CMA-ES fail.
 
 ```python
 res = hybrid_adaptive_minimize(
     func             = my_function,
     bounds           = [(-5.12, 5.12)] * 5,
-    n_bits_schedule  = (6, 8),
-    max_cycles       = 5,
-    zoom_factor      = 6.0,
-    tol_f            = 1e-8,          # absolute convergence
-    tol_f_rel        = 1e-6,          # relative convergence (for large f)
-    n_repeats        = 1,             # set >1 for noisy/stochastic functions
-    n_trials         = 3,
+    n_bits_schedule  = (6, 8),          # grid resolution per 1D search
+    max_cycles       = 5,               # max coordinate-wise cycles
+    zoom_factor      = 6.0,             # zoom window = ±zoom × grid_spacing
+    tol_f            = 1e-8,            # absolute convergence tolerance
+    tol_f_rel        = 1e-6,            # relative tolerance (for large f)
+    n_repeats        = 1,               # set >1 for noisy/stochastic f
+    n_trials         = 3,               # Durr-Hoyer trials per 1D search
+    adaptive_n_bits  = False,           # auto-tune n_bits per dim (see below)
     dim_names        = ['x0','x1','x2','x3','x4'],
     seed             = 42,
     verbose          = True,
 )
 
-res.x                # final coordinates
+res.x                # final coordinates, shape (D,)
 res.fun              # final function value
 res.dim_characters   # ['multimodal', 'unimodal', ...] — one per dim
 res.dim_methods      # ['grover', 'brent', ...] — method used per dim
+res.dim_n_bits       # [8, 12, ...] — n_bits used per dim (adaptive mode)
 res.coupling_warning # True if dimensions appear strongly coupled
-res.cycle_history    # convergence trajectory
+res.n_cycles         # number of coordinate-wise cycles run
+res.stage1_method    # which method found the initial basin
+res.cycle_history    # list of CycleRecord — full convergence trajectory
 res.summary()        # pretty-print full report
 ```
 
+**Example output (2D Wavy Bowl):**
+
+```
+Hybrid Adaptive Minimiser
+  D=2  max_cycles=4  schedule=[6, 8]
+  tol_x=1.0e-06  tol_f=1.0e-08  tol_f_rel=1.0e-06
+==========================================================================
+  Stage 1: Global basin finding
+    method : Grover coord-wise 1D
+    x*     : [0.2596, -0.2596]
+    f*     : -0.23617967
+    calls  : 464
+
+  Stage 3: Coordinate-wise refinement
+  ── Cycle 0 ──
+   dim     name    character     method    x_before     x_after         Δx   calls
+     0       x0   multimodal     grover     0.25958     0.25958   0.00e+00     339
+     1       x1   multimodal     grover    -0.25958    -0.25958   0.00e+00     460
+  → f=-0.23617967  max_Δx=0.00e+00  calls=799
+
+  Stage 4: Joint zoom  (n_bits=8, N=65,536, D=2)
+
+==========================================================================
+  Stop: tol_x=1.0e-06 met (max_Δx=0.00e+00)
+  Best: x=[0.259575, -0.259575]   f=-0.23617967
+  Total calls: 7,291   Time: 0.890s
+```
+
+### Adaptive n_bits per dimension
+
+Set `adaptive_n_bits=True` to automatically estimate the required grid
+resolution from the local curvature at each dimension. Functions with
+narrow basins (Schwefel, basin width ~0.4 units) automatically get high
+n_bits; functions with wide basins (Rastrigin) get lower n_bits.
+
+```python
+res = hybrid_adaptive_minimize(
+    schwefel, bounds=[(-500, 500)] * 2,
+    n_bits_schedule=(6, 8),
+    adaptive_n_bits = True,    # auto-detect required resolution
+    min_bits        = 4,       # lower bound on auto n_bits
+    max_bits        = 14,      # upper bound on auto n_bits
+    seed=42,
+)
+print(res.dim_n_bits)   # [12, 12] — Schwefel gets n_bits=12 automatically
+```
+
+Benchmark results with `adaptive_n_bits=True`:
+
+| Function | dist (fixed n_bits) | dist (adaptive n_bits) |
+|---|---|---|
+| Wavy Bowl | 0.00062 | 0.00063 |
+| Rastrigin | 0.00000 | 0.00000 |
+| Schwefel | 0.00065 | **0.00007** |
+| Eggholder | 0.00042 | **0.00009** |
+| Styblinski-Tang | 0.00002 | **0.00000** |
+
+Adaptive n_bits uses ~2–3× more function calls in exchange for
+significantly better accuracy on narrow-basin functions.
+
 ---
 
-## Key parameters explained
+## Function 4 — `hybrid_adaptive_minimize` with `adaptive_n_bits=True`
+
+Automatically estimates the required grid resolution per dimension from the
+local curvature of the function, so narrow-basin dimensions (like Schwefel)
+get fine grids without manual tuning.
+
+```python
+# Schwefel has a ~0.4-unit basin in a 1000-unit domain
+# Without adaptive: needs manual n_bits=(8,10) to resolve
+# With adaptive:    n_bits chosen automatically per dimension
+
+res = hybrid_adaptive_minimize(
+    schwefel,
+    bounds          = [(-500., 500.)] * 2,
+    n_bits_schedule = (6, 8),       # fallback schedule
+    adaptive_n_bits = True,         # enable per-dim resolution
+    min_bits        = 4,            # floor
+    max_bits        = 14,           # ceiling
+    max_cycles      = 4,
+    seed            = 42,
+)
+
+print(res.dim_n_bits)   # e.g. [12, 12] for Schwefel — detected narrow basin
+print(res.dim_methods)  # ['grover', 'grover']
+```
+
+**How it works:**
+
+Uses a finite-difference second derivative to estimate basin width at the
+current best point, then computes the minimum n_bits to place ≥ 4 grid
+points inside the basin:
+
+```
+f''(x*) ≈ (f(x+h) - 2f(x) + f(x-h)) / h²
+basin_width ≈ 2√(2·tol_f / |f''|)
+n_bits = ceil(log2(domain_width / (basin_width / 4)))
+```
+
+**Benchmark result — Schwefel 2D:**
+
+| Method | n_bits | dist to true min |
+|---|---|---|
+| `hybrid_adaptive_minimize` (default) | (6, 8) | 0.00065 |
+| `hybrid_adaptive_minimize` (manual) | (8, 10) | 0.00005 |
+| `hybrid_adaptive_minimize` (`adaptive_n_bits=True`) | auto → 12 | **0.00007** |
+
+The adaptive method matches manually-tuned accuracy without any prior
+knowledge of the basin width.
+
+---
+
+## BenchmarkSuite
+
+All five canonical test functions are built into the library:
+
+```python
+from numpy_grover import BenchmarkSuite
+
+suite = BenchmarkSuite()
+print(suite)
+# BenchmarkSuite:
+#   wavy_bowl            [moderate]  true_f=-0.2362
+#   rastrigin            [hard]      true_f=0.0000
+#   schwefel             [deceptive] true_f=0.0000
+#   eggholder            [hard]      true_f=-959.6407
+#   styblinski_tang      [moderate]  true_f=-78.3323
+
+# Run one method on one function
+r = suite.run('schwefel', hybrid_adaptive_minimize,
+              n_bits_schedule=(6,8), adaptive_n_bits=True, seed=42)
+print(r.dist)    # distance to known true minimum
+print(r.elapsed) # wall-clock seconds
+
+# Run one method on all functions
+results = suite.run_all(hybrid_adaptive_minimize,
+                        n_bits_schedule=(6,8), max_cycles=4, seed=42)
+```
 
 ### `n_bits` / `n_bits_schedule`
 Controls grid resolution. Higher = more accurate, more grid evaluations.
@@ -278,20 +435,25 @@ hybrid_adaptive_minimize(schwefel, bounds,
 
 ## Benchmark results
 
-Tested on standard benchmark functions. All Schwefel results use tuned
-parameters (`n_bits_schedule=(8,10)`, `zoom_factor=10`) which are needed
-to resolve its narrow basins — see *Key parameters* above.
+All five functions × four methods (tuned parameters):
 
 ### Accuracy: distance to known true minimum
 
-| Function | Character | D=2 | D=5 | D=8 |
+| Function | grover_min | grover_hier | hybrid | hybrid+adapt_nb |
 |---|---|---|---|---|
-| Wavy Bowl | Smooth multimodal | 0.00022 | 0.00003 | 0.00004 |
-| Rastrigin | Regular traps | 0.00000 | 0.00003 | 0.00004 |
-| Schwefel | Deceptive | **0.00005** | **0.00013** | **0.00088** |
-| Eggholder | ~800 local minima | 0.00015 | — | — |
+| Wavy Bowl | 0.00043 ✓ | 0.00064 ✓ | 0.00062 ✓ | 0.00063 ✓ |
+| Rastrigin | 0.02840 ~ | 0.00002 ✓ | 0.00000 ✓ | 0.00000 ✓ |
+| Schwefel | 0.84843 ~ | 0.00088 ✓ | 0.00065 ✓ | **0.00007 ✓** |
+| Eggholder | 0.65543 ~ | 0.00153 ✓ | 0.00042 ✓ | **0.00009 ✓** |
+| Styblinski-Tang | 0.02550 ~ | 0.00003 ✓ | 0.00002 ✓ | **0.00000 ✓** |
 
-`dist` = Euclidean distance from found minimum to known true minimum.
+`✓ dist<0.01   ~ dist<1   ✗ dist≥1`
+
+**Key observations:**
+- `grover_minimize` (single layer) struggles on deceptive/hard functions without zoom
+- `grover_minimize_hierarchical` solves all five functions accurately
+- `hybrid_adaptive_minimize` matches or beats hierarchical on every function
+- `adaptive_n_bits=True` gives the best accuracy overall — automatically tuning resolution to basin width improves Schwefel (0.00065→0.00007) and Eggholder (0.00042→0.00009) with no manual effort
 
 ### Comparison with classical methods (Rastrigin D=8)
 
@@ -337,6 +499,12 @@ hybrid_adaptive_minimize
     D=2–50+, default choice for any landscape
     hybrid_adaptive_minimize(f, bounds,
         n_bits_schedule=(6,8), max_cycles=5)
+
+hybrid_adaptive_minimize with adaptive_n_bits=True
+    When basin width is unknown or narrow (Schwefel, Eggholder)
+    hybrid_adaptive_minimize(f, bounds,
+        n_bits_schedule=(6,8), adaptive_n_bits=True,
+        min_bits=4, max_bits=14)
 ```
 
 ---

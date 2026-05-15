@@ -77,6 +77,7 @@ from .core import (
 
     # ── Built-in benchmark functions ─────────────────────────────────
     BENCHMARK_FUNCTIONS,
+    BenchmarkSuite,
     validate_all,
     benchmark,
 )
