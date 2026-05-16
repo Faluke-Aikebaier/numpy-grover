@@ -11,7 +11,7 @@ Implements the [Grover / Durr-Hoyer](https://arxiv.org/abs/quant-ph/9607014) min
 
 ## What it does
 
-It demonstrate the Durr-Hoyer algorithm without quantum hardware. The Grover / Durr-Hoyer algorithm searches a pre-evaluated cost array of N points in **O(√N) oracle calls** instead of O(N) — a quadratic speedup on the *search* step.
+It demonstrate the Durr-Hoyer algorithm without quantum hardware. The Grover / Durr-Hoyer algorithm searches a pre-evaluated cost array of N points in **O(√N) oracle calls** instead of O(N) — a quadratic speedup on the *search* step. It can be used for prototyping and testing quantum search circuits before running on real hardware. 
 
 ### Honest note on classical hardware
 
