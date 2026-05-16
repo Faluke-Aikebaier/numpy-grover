@@ -39,12 +39,12 @@ This library is best understood as a **quantum-inspired** optimiser: it faithful
 
 ## Four functions
 
-| Function | Best for | Dimensions |
-|---|---|---|
-| `grover_minimize` | Quick single-layer search, prototyping | D=1–4 |
-| `grover_minimize_hierarchical` | High accuracy via zoom-and-refine | D=2–4 |
-| `hybrid_adaptive_minimize` | Mixed landscapes, coordinate-wise, D=2–50+ | D=2–50+ |
-| `hybrid_adaptive_minimize` with `adaptive_n_bits=True` | Narrow basins, unknown resolution | D=2–50+ |
+| Function | What it does | Best for | Dimensions |
+|---|---|---|---|
+| `grover_minimize` |Bare Qiskit drop-in, just the algorithm itself | Quick single-layer search, prototyping | D=1–4 |
+| `grover_minimize_hierarchical` | Wraps it in a real optimisation interface with grid and bounds | High accuracy via zoom-and-refine | D=2–4 |
+| `hybrid_adaptive_minimize` | Makes it practical by adding zoom-and-refine | Mixed landscapes, coordinate-wise, D=2–50+ | D=2–50+ |
+| `hybrid_adaptive_minimize` with `adaptive_n_bits=True` | Pushes it toward real use cases with dimension classification and adaptive resolution | Narrow basins, unknown resolution | D=2–50+ |
 
 > **Curse of dimensionality:** Grover halves the exponent of the search cost
 > (O(N) → O(√N)) but the grid size N = (2^n_bits)^D still grows exponentially
