@@ -2,7 +2,7 @@
 
 **Quantum-inspired global optimisation in pure NumPy.**
 
-Implements the [Grover / Durr-Hoyer](https://arxiv.org/abs/quant-ph/9607014) minimum-finding algorithm with a hierarchical zoom-and-refine strategy and a hybrid adaptive minimiser for medium-to-high dimensional problems.
+Implements the [Grover / Durr-Hoyer](https://arxiv.org/abs/quant-ph/9607014) minimum-finding algorithm with a hierarchical zoom-and-refine strategy and a hybrid adaptive minimiser for medium-to-high dimensional problems. It is built as a classical simulation of a quantum algorithm for educational and research purposes.
 
 **Author:** Faluke Aikebaier  
 **License:** MIT
